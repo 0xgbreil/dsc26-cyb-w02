@@ -1,7 +1,4 @@
-"""My own tests: one or more per rule in README.md ("What to build"), edge cases first.
-
-The public tests are only a smoke test. These follow the hidden-test areas (H01-H14).
-"""
+"""My own tests: one per rule in the spec."""
 import json
 import subprocess
 import sys
