@@ -24,7 +24,7 @@ flows:
   - {id: f05, source: scorer, target: case_db, data: [flag, explanation], protocol: tls, authenticated: true}
   - {id: f06, source: scorer, target: audit_log, data: [decision_record], protocol: tls, authenticated: true}
   - {id: f07, source: analyst, target: analyst_console, data: [case_decision], protocol: https, authenticated: true}
-  - {id: f08, source: analyst_console, target: case_db, data: [case_decision, customer_pii], protocol: postgres, authenticated: true}
+  - {id: f08, source: analyst_console, target: case_db, data: [case_decision, customer_pii], protocol: tls, authenticated: true}  # was postgres (plaintext): Postgres over TLS
 threats:
   - id: T1
     target: f01
@@ -83,3 +83,21 @@ threats:
   - {id: T24, target: scorer, category: R, title: Scorer cannot show which model version produced a past flag, likelihood: 3, impact: 4, status: open}
   - {id: T25, target: scorer, category: D, title: Crafted transfer graph with huge fan-out makes scoring take seconds, likelihood: 2, impact: 4, status: open}
   - {id: T26, target: case_db, category: D, title: Case database fills its disk during a scam wave and stops accepting flags, likelihood: 2, impact: 4, status: open}
+  # Added to close the 11 coverage gaps (T27-T37) and the personal-data policy finding (T38).
+  # f08: analyst console -> case database
+  - {id: T27, target: f08, category: T, title: Case decision or beneficiary account changed on the wire between the console and the case database, likelihood: 1, impact: 4, status: mitigated, mitigation: f08 now runs Postgres over TLS with server certificate verification (was plaintext postgres)}
+  - {id: T28, target: f08, category: I, title: Customer PII read by anyone on the office network while it crosses from the console to the database, likelihood: 1, impact: 4, status: mitigated, mitigation: f08 now runs Postgres over TLS; the database refuses unencrypted connections}
+  - {id: T29, target: f08, category: D, title: Office network fault or flood cuts analysts off from open cases during a scam wave, likelihood: 2, impact: 3, status: open}
+  # case_db
+  - {id: T30, target: case_db, category: T, title: Case verdicts edited directly in the database, bypassing the console and its audit trail, likelihood: 2, impact: 5, status: open}
+  # scorer
+  - {id: T31, target: scorer, category: E, title: Scorer service account holds wider database rights than it needs, so a scorer bug can rewrite cases, likelihood: 2, impact: 4, status: open}
+  # analyst_console
+  - {id: T32, target: analyst_console, category: S, title: Phished analyst password lets an attacker work cases as that analyst, likelihood: 3, impact: 4, status: open}
+  - {id: T33, target: analyst_console, category: T, title: Malware on an analyst laptop alters a case decision before the console saves it, likelihood: 2, impact: 4, status: open}
+  - {id: T34, target: analyst_console, category: R, title: Analyst denies freezing or releasing a customer account and the console keeps no per-action record, likelihood: 3, impact: 4, status: open}
+  - {id: T35, target: analyst_console, category: I, title: Case view shows full account numbers and ID details to every analyst, not only the assigned one, likelihood: 4, impact: 3, status: open}
+  - {id: T36, target: analyst_console, category: D, title: Unbounded case searches in the console exhaust it while the queue is full, likelihood: 3, impact: 3, status: open}
+  - {id: T37, target: analyst_console, category: E, title: Junior analyst calls the supervisor-only account release action directly, likelihood: 3, impact: 5, status: open}
+  # feature_store: personal-data store that had no information-disclosure threat
+  - {id: T38, target: feature_store, category: I, title: Behavioural account features about customers read by anyone with scorer database access, likelihood: 2, impact: 4, status: open}
