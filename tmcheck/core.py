@@ -1,364 +1,298 @@
-"""tmcheck: a checker for threat models kept as YAML in the repository.
-
-Fill in every function. Keep the names and signatures exactly as they are: the grader imports them.
-The full rules are in README.md ("What to build").
-"""
+"""tmcheck core: load, validate and analyse a STRIDE threat model."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 import yaml
 
-# Tuples, not sets or strings: membership tests then never raise on unhashable
-# values, and "ST" in ("S", "T", ...) is False (it would be True for a string).
-STRIDE = ("S", "T", "R", "I", "D", "E")
-KINDS = ("external_entity", "process", "data_store")
-STATUSES = ("open", "mitigated", "accepted")
-SECTIONS = ("zones", "elements", "flows", "threats")
-ENCRYPTED = ("https", "tls", "mtls", "sftp", "ssh")
-
 
 class ModelError(Exception):
-    """The file cannot be read as a threat model."""
+    """The model file cannot be used at all."""
 
 
 @dataclass(frozen=True, order=True)
 class Issue:
-    ref: str          # id of the zone/element/flow/threat the issue is about
+    ref: str
     code: str
     message: str = ""
 
 
 @dataclass(frozen=True, order=True)
 class Gap:
-    ref: str          # element or flow id
-    category: str     # one STRIDE letter
+    ref: str
+    category: str
 
 
 @dataclass(frozen=True)
 class RankedThreat:
     id: str
     score: int
-    level: str        # "high" | "medium" | "low"
+    level: str
 
 
+SECTIONS = ("zones", "elements", "flows", "threats")
+STRIDE = ("S", "T", "R", "I", "D", "E")  # canonical order, NOT alphabetical
+KINDS = ("external_entity", "process", "data_store")
+STATUSES = ("open", "mitigated", "accepted")
+ENCRYPTED = {"https", "tls", "mtls", "sftp", "ssh"}
 
-# Small helpers --------------------------------------------------------------------------
 
-
-def _items(model: dict, section: str) -> list[dict]:
-    """The mapping entries of one section. Missing, null or non-list sections give []."""
-    value = model.get(section) if isinstance(model, dict) else None
+# ---------------------------------------------------------------- helpers
+def _items(model: dict, key: str) -> list[dict]:
+    """Section as a list of mappings; tolerant of missing/None/odd entries."""
+    value = model.get(key) if isinstance(model, dict) else None
     if not isinstance(value, list):
         return []
-    return [item for item in value if isinstance(item, dict)]
+    return [x for x in value if isinstance(x, dict)]
 
 
-def _by_id(model: dict, section: str) -> dict:
-    """id -> entry for one section. The first entry wins when an id is repeated."""
-    table: dict = {}
-    for item in _items(model, section):
-        ident = item.get("id")
-        if ident is None:
-            continue
-        try:
-            table.setdefault(ident, item)
-        except TypeError:  # unhashable id, for example a list
-            pass
-    return table
+def _is_score(v: Any) -> bool:
+    # bool is a subclass of int, so isinstance() is not enough; 4.0 is a float.
+    return type(v) is int and 1 <= v <= 5
 
 
-def _get(table: dict, key):
-    """table.get(key) that returns None instead of raising on an unhashable key."""
+def _has_text(v: Any) -> bool:
+    return isinstance(v, str) and v.strip() != ""
+
+
+def _natural_key(s: Any) -> list:
+    parts = re.split(r"(\d+)", str(s))
+    return [(0, int(p)) if p.isdigit() else (1, p) for p in parts if p != ""]
+
+
+def _stride_pos(c: str) -> int:
+    return STRIDE.index(c)
+
+
+def _element_map(model: dict) -> dict:
+    out: dict = {}
+    for e in _items(model, "elements"):
+        eid = e.get("id")
+        if isinstance(eid, (str, int)) and not isinstance(eid, bool):
+            out.setdefault(eid, e)
+    return out
+
+
+def _flow_map(model: dict) -> dict:
+    out: dict = {}
+    for f in _items(model, "flows"):
+        fid = f.get("id")
+        if isinstance(fid, (str, int)) and not isinstance(fid, bool):
+            out.setdefault(fid, f)
+    return out
+
+
+def _hashable(v: Any) -> bool:
     try:
-        return table.get(key)
+        hash(v)
     except TypeError:
-        return None
+        return False
+    return True
 
 
-def _is_score(value) -> bool:
-    """An integer from 1 to 5. bool is a subclass of int and 4.0 is a float: neither counts."""
-    return type(value) is int and 1 <= value <= 5
-
-
-def _is_blank(text) -> bool:
-    """True when there is no text, or only whitespace."""
-    return text is None or not str(text).strip()
-
-
-def _natural_key(text) -> list:
-    """Sort key where 'T2' comes before 'T10'. Parts alternate text, number, text, ..."""
-    parts = re.split(r"(\d+)", str(text))
-    return [int(part) if i % 2 else part for i, part in enumerate(parts)]
-
-
-def _element_categories(element: dict) -> set[str] | None:
-    """STRIDE letters for an element, or None when its kind is not valid."""
-    kind = element.get("kind")
-    if isinstance(kind, str) and kind in KINDS:
-        return applicable(kind, is_log=element.get("is_log") is True)
-    return None
-
-
-# --------------------------------------------------------------------------
-# load_model
-# --------------------------------------------------------------------------
-
+# ------------------------------------------------------------------ load
 def load_model(path) -> dict:
-    """Read the YAML file with yaml.safe_load and return the mapping.
-
-    Missing or null `zones`, `elements`, `flows`, `threats` become []. Raise ModelError if the
-    file cannot be read, is not valid YAML, uses a tag safe_load refuses, has a top level that
-    is not a mapping, or has one of the four sections that is not a list.
-    """
     try:
-        # Bytes: PyYAML detects the encoding itself. safe_load only: the file chooses
-        # nothing about which Python objects get built.
-        with open(path, "rb") as handle:
-            data = yaml.safe_load(handle)
-    except (OSError, yaml.YAMLError, ValueError, RecursionError) as exc:
-        # YAMLError covers bad syntax, bad encoding and refused tags (ConstructorError);
-        # ValueError covers impossible dates such as 2024-13-45.
-        raise ModelError(f"cannot load {path}: {exc}") from exc
-
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ModelError(f"cannot read {path}: {exc}") from exc
+    except yaml.YAMLError as exc:  # includes ConstructorError (unsafe tags)
+        raise ModelError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(data, dict):
-        raise ModelError("the top level of the model must be a mapping")
-
-    for section in SECTIONS:
-        value = data.get(section)
+        raise ModelError("top level of the model must be a mapping")
+    for key in SECTIONS:
+        value = data.get(key)
         if value is None:
-            data[section] = []
+            data[key] = []
         elif not isinstance(value, list):
-            raise ModelError(f"section '{section}' must be a list")
+            raise ModelError(f"section '{key}' must be a list")
     return data
 
 
-# --------------------------------------------------------------------------
-# applicable
-# --------------------------------------------------------------------------
-
+# ------------------------------------------------------------ applicable
 def applicable(kind: str, *, is_log: bool = False) -> set[str]:
-    """STRIDE per element: the categories that apply to `kind`. Unknown kind: ValueError."""
     if kind == "external_entity":
         return {"S", "R"}
     if kind == "process":
         return set(STRIDE)
     if kind == "data_store":
-        # No S: a database does not log in to anything. R only where the evidence lives.
         return {"T", "I", "D", "R"} if is_log else {"T", "I", "D"}
     if kind == "data_flow":
         return {"T", "I", "D"}
     raise ValueError(f"unknown kind: {kind!r}")
 
 
-# --------------------------------------------------------------------------
-# validate
-# --------------------------------------------------------------------------
-
+# -------------------------------------------------------------- validate
 def validate(model: dict) -> list[Issue]:
-    """Structural problems, sorted by (ref, code, message), no duplicates."""
     issues: set[Issue] = set()
-    zones = _by_id(model, "zones")
-    elements = _by_id(model, "elements")
-    flows = _by_id(model, "flows")
+    zones = _items(model, "zones")
+    elements = _items(model, "elements")
+    flows = _items(model, "flows")
+    threats = _items(model, "threats")
 
-    # DUPLICATE_ID: zones, elements, flows and threats share one id space.
-    counts: dict = {}
-    for section in SECTIONS:
-        for item in _items(model, section):
-            ident = item.get("id")
-            if ident is None:
-                continue
-            try:
-                counts[ident] = counts.get(ident, 0) + 1
-            except TypeError:
-                pass
-    for ident, count in counts.items():
-        if count > 1:
-            issues.add(Issue(str(ident), "DUPLICATE_ID", f"id is used {count} times"))
+    # one id space for the whole model
+    seen: dict = {}
+    for item in zones + elements + flows + threats:
+        i = item.get("id")
+        if i is None or not _hashable(i):
+            continue
+        seen[i] = seen.get(i, 0) + 1
+    for i, n in seen.items():
+        if n > 1:
+            issues.add(Issue(str(i), "DUPLICATE_ID", f"id used {n} times"))
 
-    # Elements: BAD_KIND, UNKNOWN_ZONE
-    for element in _items(model, "elements"):
-        ref = str(element.get("id"))
-        if _element_categories(element) is None:
-            issues.add(Issue(ref, "BAD_KIND", f"kind {element.get('kind')!r} is not valid"))
-        if _get(zones, element.get("zone")) is None:
-            issues.add(Issue(ref, "UNKNOWN_ZONE", f"zone {element.get('zone')!r} is not defined"))
+    zone_ids = {z.get("id") for z in zones if _hashable(z.get("id"))}
+    emap = _element_map(model)
+    fmap = _flow_map(model)
 
-    # Flows: UNKNOWN_REF, INVALID_FLOW
-    for flow in _items(model, "flows"):
-        ref = str(flow.get("id"))
-        source, target = flow.get("source"), flow.get("target")
-        source_el, target_el = _get(elements, source), _get(elements, target)
+    for e in elements:
+        ref = str(e.get("id"))
+        if e.get("kind") not in KINDS:
+            issues.add(Issue(ref, "BAD_KIND", f"bad kind {e.get('kind')!r}"))
+        z = e.get("zone")
+        if not _hashable(z) or z not in zone_ids:
+            issues.add(Issue(ref, "UNKNOWN_ZONE", f"unknown zone {z!r}"))
 
-        if source_el is None or target_el is None:
-            issues.add(Issue(ref, "UNKNOWN_REF", "source or target is not an element"))
+    for f in flows:
+        ref = str(f.get("id"))
+        src, dst = f.get("source"), f.get("target")
+        src_ok = _hashable(src) and src in emap
+        dst_ok = _hashable(dst) and dst in emap
+        if not src_ok:
+            issues.add(Issue(ref, "UNKNOWN_REF", f"unknown source {src!r}"))
+        if not dst_ok:
+            issues.add(Issue(ref, "UNKNOWN_REF", f"unknown target {dst!r}"))
+        if src_ok and dst_ok:
+            if src == dst:
+                issues.add(Issue(ref, "INVALID_FLOW", "source equals target"))
+            elif emap[src].get("kind") != "process" and emap[dst].get("kind") != "process":
+                issues.add(Issue(ref, "INVALID_FLOW", "neither end is a process"))
 
-        invalid = source == target
-        if not invalid and source_el is not None and target_el is not None:
-            # Spec gap: "neither end is a process" is judged only when both ends exist.
-            # A missing end is already reported as UNKNOWN_REF.
-            invalid = (source_el.get("kind") != "process"
-                       and target_el.get("kind") != "process")
-        if invalid:
-            issues.add(Issue(ref, "INVALID_FLOW",
-                             "source equals target, or neither end is a process"))
+    for t in threats:
+        ref = str(t.get("id"))
+        target = t.get("target")
+        known = _hashable(target) and (target in emap or target in fmap)
+        if not known:
+            issues.add(Issue(ref, "UNKNOWN_REF", f"unknown target {target!r}"))
 
-    # Threats: UNKNOWN_REF, category, score and decision codes
-    for threat in _items(model, "threats"):
-        ref = str(threat.get("id"))
-        target = threat.get("target")
-        category = threat.get("category")
-        target_el = _get(elements, target)
-        target_is_flow = _get(flows, target) is not None
-
-        if target_el is None and not target_is_flow:
-            issues.add(Issue(ref, "UNKNOWN_REF", f"target {target!r} is not an element or a flow"))
-
-        if not (isinstance(category, str) and category in STRIDE):
-            issues.add(Issue(ref, "BAD_CATEGORY", f"category {category!r} is not one of S T R I D E"))
-        else:
-            if target_el is not None:
-                allowed = _element_categories(target_el)  # None when the kind is bad
-            elif target_is_flow:
-                allowed = applicable("data_flow")
+        cat = t.get("category")
+        if not (isinstance(cat, str) and cat in STRIDE):
+            issues.add(Issue(ref, "BAD_CATEGORY", f"bad category {cat!r}"))
+        elif known:
+            if target in emap:
+                el = emap[target]
+                kind = el.get("kind")
+                if kind in KINDS:
+                    ok = applicable(kind, is_log=el.get("is_log") is True)
+                else:
+                    ok = None  # BAD_KIND is reported on the element itself
             else:
-                allowed = None
-            if allowed is not None and category not in allowed:
+                ok = applicable("data_flow")
+            if ok is not None and cat not in ok:
                 issues.add(Issue(ref, "INAPPLICABLE_CATEGORY",
-                                 f"{category} does not apply to {target}"))
+                                 f"{cat} does not apply to {target}"))
 
-        bad_scores = [name for name in ("likelihood", "impact") if not _is_score(threat.get(name))]
-        if bad_scores:
-            issues.add(Issue(ref, "BAD_SCORE", "not an integer from 1 to 5: " + ", ".join(bad_scores)))
+        for field in ("likelihood", "impact"):
+            if not _is_score(t.get(field)):
+                issues.add(Issue(ref, "BAD_SCORE", f"{field} must be an int 1-5"))
 
-        status = threat.get("status")
-        if not (isinstance(status, str) and status in STATUSES):
-            issues.add(Issue(ref, "BAD_STATUS", f"status {status!r} is not open, mitigated or accepted"))
-        elif status == "mitigated" and _is_blank(threat.get("mitigation")):
-            issues.add(Issue(ref, "MISSING_MITIGATION", "mitigated but no mitigation text"))
-        elif status == "accepted" and _is_blank(threat.get("justification")):
-            issues.add(Issue(ref, "MISSING_JUSTIFICATION", "accepted but no justification text"))
+        status = t.get("status")
+        if status not in STATUSES:
+            issues.add(Issue(ref, "BAD_STATUS", f"bad status {status!r}"))
+        elif status == "mitigated" and not _has_text(t.get("mitigation")):
+            issues.add(Issue(ref, "MISSING_MITIGATION", "mitigation text is empty"))
+        elif status == "accepted" and not _has_text(t.get("justification")):
+            issues.add(Issue(ref, "MISSING_JUSTIFICATION", "justification text is empty"))
 
-    return sorted(issues)
+    return sorted(issues, key=lambda i: (i.ref, i.code, i.message))
 
 
-# --------------------------------------------------------------------------
-# crossing_flows, coverage_gaps
-# --------------------------------------------------------------------------
+# ------------------------------------------------------------- crossings
+def _crossing(model: dict) -> list[dict]:
+    emap = _element_map(model)
+    out = []
+    for f in _items(model, "flows"):
+        s, d = f.get("source"), f.get("target")
+        if not (_hashable(s) and _hashable(d) and s in emap and d in emap):
+            continue
+        if emap[s].get("zone") != emap[d].get("zone"):
+            out.append(f)
+    return out
+
 
 def crossing_flows(model: dict) -> list[str]:
-    """Ids of flows whose source and target are in different zones, in file order."""
-    elements = _by_id(model, "elements")
-    result = []
-    for flow in _items(model, "flows"):
-        source = _get(elements, flow.get("source"))
-        target = _get(elements, flow.get("target"))
-        if source is None or target is None:
-            continue  # a flow with an unknown end is skipped
-        if source.get("zone") != target.get("zone"):
-            result.append(flow.get("id"))
-    return result
+    return [f.get("id") for f in _crossing(model)]
 
 
+# -------------------------------------------------------------- coverage
 def coverage_gaps(model: dict) -> list[Gap]:
-    """(ref, category) pairs in scope with no threat recorded, sorted by ref then S, T, R, I, D, E."""
-    elements = _by_id(model, "elements")
-    crossing = crossing_flows(model)
-
-    # Scope: every crossing flow plus both of its end elements, with the letters
-    # that apply to each of them.
-    scope: dict = {}
-    for flow in _items(model, "flows"):
-        if flow.get("id") not in crossing:
-            continue
-        scope.setdefault(flow.get("id"), set()).update(applicable("data_flow"))
-        for end in (flow.get("source"), flow.get("target")):
-            element = _get(elements, end)
-            letters = _element_categories(element) if element is not None else None
-            if letters is not None:
-                scope.setdefault(end, set()).update(letters)
-
-    # Any threat with that target and category covers the pair, in any status.
+    emap = _element_map(model)
     covered = set()
-    for threat in _items(model, "threats"):
-        try:
-            covered.add((threat.get("target"), threat.get("category")))
-        except TypeError:
-            pass
+    for t in _items(model, "threats"):
+        if _hashable(t.get("target")) and _hashable(t.get("category")):
+            covered.add((t.get("target"), t.get("category")))
 
-    gaps = [Gap(str(ref), letter)
-            for ref, letters in scope.items()
-            for letter in STRIDE
-            if letter in letters and (ref, letter) not in covered]
-    return sorted(gaps, key=lambda gap: (gap.ref, STRIDE.index(gap.category)))
+    scope: dict = {}  # ref -> set of applicable categories
+    for f in _crossing(model):
+        scope[f.get("id")] = applicable("data_flow")
+        for end in (f.get("source"), f.get("target")):
+            el = emap[end]
+            kind = el.get("kind")
+            if kind in KINDS:
+                scope[end] = applicable(kind, is_log=el.get("is_log") is True)
+
+    gaps = [Gap(str(ref), c)
+            for ref, cats in scope.items()
+            for c in cats
+            if (ref, c) not in covered]
+    return sorted(gaps, key=lambda g: (g.ref, _stride_pos(g.category)))
 
 
-# --------------------------------------------------------------------------
-# policy_findings
-# --------------------------------------------------------------------------
-
+# ---------------------------------------------------------------- policy
 def policy_findings(model: dict) -> list[Issue]:
-    """UNENCRYPTED_CROSSING, UNAUTHENTICATED_INBOUND, PII_STORE_WITHOUT_I_THREAT, sorted by (ref, code)."""
-    elements = _by_id(model, "elements")
-    zones = _by_id(model, "zones")
-    crossing = crossing_flows(model)
-    findings: set[Issue] = set()
+    found: list[Issue] = []
+    emap = _element_map(model)
+    trust = {z.get("id"): z.get("trust") for z in _items(model, "zones")
+             if _hashable(z.get("id"))}
 
-    for flow in _items(model, "flows"):
-        if flow.get("id") not in crossing:
-            continue
-        ref = str(flow.get("id"))
+    for f in _crossing(model):
+        ref = str(f.get("id"))
+        proto = f.get("protocol")
+        if not (isinstance(proto, str) and proto.casefold() in ENCRYPTED):
+            found.append(Issue(ref, "UNENCRYPTED_CROSSING", f"protocol {proto!r}"))
+        zs = emap[f.get("source")].get("zone")
+        zd = emap[f.get("target")].get("zone")
+        ts, td = trust.get(zs), trust.get(zd)
+        if (type(ts) is int and type(td) is int and td > ts
+                and f.get("authenticated") is not True):
+            found.append(Issue(ref, "UNAUTHENTICATED_INBOUND",
+                               "inbound to a more trusted zone without authentication"))
 
-        protocol = flow.get("protocol")
-        if not (isinstance(protocol, str) and protocol.lower() in ENCRYPTED):
-            findings.add(Issue(ref, "UNENCRYPTED_CROSSING",
-                               f"protocol {protocol!r} is not https, tls, mtls, sftp or ssh"))
+    has_i = {t.get("target") for t in _items(model, "threats")
+             if t.get("category") == "I" and _hashable(t.get("target"))}
+    for e in _items(model, "elements"):
+        if (e.get("kind") == "data_store" and e.get("holds_pii") is True
+                and e.get("id") not in has_i):
+            found.append(Issue(str(e.get("id")), "PII_STORE_WITHOUT_I_THREAT",
+                               "store holds PII but has no I threat"))
 
-        # Crossing flows always have both end elements.
-        source_zone = _get(zones, _get(elements, flow.get("source")).get("zone"))
-        target_zone = _get(zones, _get(elements, flow.get("target")).get("zone"))
-        if source_zone is not None and target_zone is not None:
-            source_trust, target_trust = source_zone.get("trust"), target_zone.get("trust")
-            if (type(source_trust) is int and type(target_trust) is int
-                    and target_trust > source_trust
-                    and flow.get("authenticated") is not True):
-                findings.add(Issue(ref, "UNAUTHENTICATED_INBOUND",
-                                   "flow into a more trusted zone is not authenticated"))
-
-    has_i_threat = set()
-    for threat in _items(model, "threats"):
-        if threat.get("category") == "I":
-            try:
-                has_i_threat.add(threat.get("target"))
-            except TypeError:
-                pass
-    for element in _items(model, "elements"):
-        if (element.get("kind") == "data_store" and element.get("holds_pii") is True
-                and element.get("id") not in has_i_threat):
-            findings.add(Issue(str(element.get("id")), "PII_STORE_WITHOUT_I_THREAT",
-                               "store holds personal data but has no information-disclosure threat"))
-
-    return sorted(findings, key=lambda issue: (issue.ref, issue.code, issue.message))
+    return sorted(found, key=lambda i: (i.ref, i.code, i.message))
 
 
-# --------------------------------------------------------------------------
-# rank
-# --------------------------------------------------------------------------
-
+# ------------------------------------------------------------------ rank
 def rank(model: dict) -> list[RankedThreat]:
-    """Open threats with valid scores, by score desc, then impact desc, then natural id order."""
     rows = []
-    for threat in _items(model, "threats"):
-        if threat.get("status") != "open":
+    for t in _items(model, "threats"):
+        if t.get("status") != "open":
             continue
-        likelihood, impact = threat.get("likelihood"), threat.get("impact")
-        if not (_is_score(likelihood) and _is_score(impact)):
-            continue  # an invalid score is skipped, not ranked
-        score = likelihood * impact
+        l, i = t.get("likelihood"), t.get("impact")
+        if not (_is_score(l) and _is_score(i)):
+            continue
+        score = l * i
         level = "high" if score >= 15 else "medium" if score >= 8 else "low"
-        rows.append((score, impact, threat.get("id"), level))
-
-    rows.sort(key=lambda row: (-row[0], -row[1], _natural_key(row[2])))
-    return [RankedThreat(id=row[2], score=row[0], level=row[3]) for row in rows]
+        rows.append((score, i, t.get("id"), level))
+    rows.sort(key=lambda r: (-r[0], -r[1], _natural_key(r[2])))
+    return [RankedThreat(str(tid), score, level) for score, _, tid, level in rows]
